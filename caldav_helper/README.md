@@ -573,7 +573,7 @@ ORGANIZER;replace;*@contoso.*;*@360.contoso.ru
         - В поле `Redirect URL` вводим `https://oauth.yandex.ru/verification_code`
         - В разделе "Почта для связи" указываем свой email.
           
-        <img src="images/create_oauth_app_01.jpg" width="800">
+        <img src="images/create_app_01.jpg" width="800">
         
     * Добавляем разрешения для токена. Для этого в разделе "Доступ к данным" ищем и добавляем следующие разрешения:
 
@@ -586,7 +586,7 @@ ORGANIZER;replace;*@contoso.*;*@360.contoso.ru
    | (опционально) `ya360_security:service_applications_read` | чтение  сервисных приложений (для настройки сервисного приложения) |
    | (опционально) `ya360_security:service_applications_write` | запись  сервисных приложений (для настройки сервисного приложения) |
         
-    <img src="images/oauth_permissions.jpg" width="800">
+    <img src="images/app_perm_01.jpg" width="800">
         
     * нажимаем на кнопку "Создать приложение".
     * Свойства созданного приложения отображаются в новом окне "Мои приложения". Ищем раздел с идентификатором созданного приложения и копируем строку из поля "ClientID":
@@ -614,6 +614,8 @@ ORGANIZER;replace;*@contoso.*;*@360.contoso.ru
 После этого необходимо создать ещё одно OAuth приложение, шаги по созданию аналогичны шагам создания основного приложения. Но при указании доступных разрешений нужно указать:
 
  - `calendar:all`
+
+ <img src="images/caldav_01.jpg" width="400">
 
 После сохранения приложения нужно скопировать его Application ID и APPLICATION Secret, которые необходимо записать в соответствующие параметры в конфигурационном файле (`SERVICE_APP_ID`, `SERVICE_APP_SECRET`).
 
