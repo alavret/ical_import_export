@@ -583,8 +583,8 @@ ORGANIZER;replace;*@contoso.*;*@360.contoso.ru
    | `directory:read_domains` | Чтение информации о доменах |
    | `ya360_admin:mail_read_routing_rules` | Чтение транспортных правил обработки почты |
    | `ya360_admin:mail_write_routing_rules` | Управление транспортными правилами обработки почты |
-        | (опционально) `ya360_security:service_applications_read` | чтение  сервисных приложений (для настройки сервисного приложения) |
-        | (опционально) `ya360_security:service_applications_write` | запись  сервисных приложений (для настройки сервисного приложения) |
+   | (опционально) `ya360_security:service_applications_read` | чтение  сервисных приложений (для настройки сервисного приложения) |
+   | (опционально) `ya360_security:service_applications_write` | запись  сервисных приложений (для настройки сервисного приложения) |
         
     <img src="images/oauth_permissions.jpg" width="800">
         
