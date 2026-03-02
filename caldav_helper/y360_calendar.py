@@ -4612,7 +4612,7 @@ def main_menu(settings: "SettingParams"):
         print("9. Настройка сервисного приложения.")
         print("0. (Ctrl+C) Выход")
         print("\n")
-        choice = input("Введите ваш выбор (0-5,9): ")
+        choice = input("Введите ваш выбор (0-6,8,9): ")
 
         if choice == "0":
             print("До свидания!")
