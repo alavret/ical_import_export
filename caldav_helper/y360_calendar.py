@@ -123,9 +123,6 @@ class SettingParams:
     reports_dir: str
     output_max_mb: int
     threads: int
-    email_replace_file: str
-    email_replace_search: str
-    email_replace_replace: str
     modify_rules: str
     rule_apply_report: str
     all_users: list
@@ -157,9 +154,6 @@ def get_settings() -> Optional[SettingParams]:
         reports_dir=os.environ.get("REPORTS_DIR", "reports"),
         output_max_mb=int(os.environ.get("OUTPUT_MAX_MB", DEFAULT_OUTPUT_MAX_MB)),
         threads=int(os.environ.get("THREADS", DEFAULT_THREADS)),
-        email_replace_file=os.environ.get("EMAIL_REPLACE_FILE", ""),
-        email_replace_search=os.environ.get("EMAIL_REPLACE_SEARCH", ""),
-        email_replace_replace=os.environ.get("EMAIL_REPLACE_REPLACE", ""),
         modify_rules=os.environ.get("MODIFY_RULES", "ical_modify_rules.txt"),
         rule_apply_report=os.environ.get("RULE_APPLY_REPORT", "rule_apply.csv"),
         all_users=[],
