@@ -34,7 +34,7 @@ SLEEP_TIME_BETWEEN_API_CALLS = 0.5
 USERS_PER_PAGE_FROM_API = 1000
 DOMAINS_PER_PAGE_FROM_API = 10   # maximum allowed by API
 
-DEFAULT_OUTPUT_MAX_MB = 2
+DEFAULT_OUTPUT_MAX_MB = 9
 DEFAULT_THREADS = 4
 ALL_USERS_REFRESH_IN_MINUTES = 15
 RPS_LIMIT = 100
@@ -4637,8 +4637,6 @@ def main_menu(settings: "SettingParams"):
             service_application_status_menu(settings)
         elif choice == "666":
             delete_menu_parallel(settings)
-        elif choice == "77":
-            export_events_for_user2(settings)
         else:
             logger.error("Неверный выбор. Попробуйте снова.")
 
