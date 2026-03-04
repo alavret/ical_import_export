@@ -134,6 +134,8 @@ class SettingParams:
     create_cancel_rules_for_events_deletions: bool
     external_caldav_users_file: str
     external_caldav_url: str
+    service_app_api_data_file: str
+    
 
 class TokenError(RuntimeError):
     pass
@@ -165,6 +167,7 @@ def get_settings() -> Optional[SettingParams]:
         create_cancel_rules_for_events_deletions=os.environ.get("CREATE_CANCEL_RULES_FOR_EVENTS_DELETIONS", "false").lower() == "true",
         external_caldav_users_file=os.environ.get("EXTERNAL_CALDAV_USERS_FILE", "external_caldav_users.csv"),
         external_caldav_url=os.environ.get("EXTERNAL_CALDAV_URL", ""),
+        service_app_api_data_file=os.environ.get("SERVICE_APP_API_DATA_FILE", "service_app_api_data.json"),
     )
 
     if not settings.users_file:
@@ -3411,6 +3414,9 @@ def get_service_applications(settings: "SettingParams") -> Optional[list]:
             else:
                 applications = response.json().get("applications", [])
                 logger.info(f"Получен список {len(applications)} сервисных приложений.")
+                if not check_service_app_response(settings, response):
+                    logger.debug(f"Сервисное приложение {settings.service_app_id} не найдено в списке сервисных приложений организации или не имеет необходимых прав доступа.")
+                    return applications, f"Сервисное приложение {settings.service_app_id} не найдено в списке сервисных приложений организации или не имеет необходимых прав доступа."
                 return applications, None
     except requests.exceptions.RequestException as e:
         logger.error(f"Ошибка при выполнении запроса к API: {e}")
@@ -3437,10 +3443,6 @@ def export_service_applications_api_data(settings: "SettingParams") -> bool:
         return False
     if not applications:
         logger.error("Список сервисных приложений пуст. Невозможно выгрузить данные.")
-        return False
-    if len(applications) == 0:
-        logger.error("Список сервисных приложений пуст. Невозможно выгрузить данные.")
-        return False
 
     data = {"applications": applications}
     target_dir = os.path.dirname(settings.service_app_api_data_file)
@@ -3565,6 +3567,30 @@ def merge_service_app_permissions(existing_permissions: list, required_permissio
             existing_set.add(permission)
     return merged_permissions
 
+def check_service_app_response(settings: "SettingParams", response: requests.Response) -> bool:
+    """
+    Проверяет ответ API сервисных приложений.
+    """
+    if len(response.json().get("applications", [])) == 0:
+        return False
+    
+    found_app = False
+    for app in response.json().get("applications", []):
+        if app.get("id") == settings.service_app_id:
+            found_app = True
+            scopes = app.get("scopes", [])
+            found_permissions = True
+            for perm in SERVICE_APP_PERMISSIONS:
+                if perm not in scopes:
+                    found_permissions = False
+                    break
+            if not found_permissions:
+                return False
+    if not found_app:
+        return False
+
+    return True
+
 def setup_service_application(settings: "SettingParams") -> bool:
     """
     Добавляет/обновляет сервисное приложение и его разрешения.
@@ -3663,6 +3689,9 @@ def setup_service_application(settings: "SettingParams") -> bool:
                     logger.error("Превышено максимальное количество попыток.")
                     return False
             else:
+                if not check_service_app_response(settings, response):
+                    logger.error("Не удалось настроить сервисное приложение. Проверьте настройки и повторите попытку.")
+                    return False
                 logger.info(f"Список сервисных приложений успешно обновлен (Client ID - {client_id}).")
                 break
     except requests.exceptions.RequestException as e:
@@ -3671,28 +3700,6 @@ def setup_service_application(settings: "SettingParams") -> bool:
     except Exception as e:
         logger.error(f"Неожиданная ошибка при обновлении сервисных приложений: {type(e).__name__}: {e}")
         return False
-
-    if len(response.json().get("applications", [])) == 0:
-        logger.error("Не удалось настроить сервисное приложение. Проверьте настройки и повторите попытку.")
-        return False
-    
-    found_app = False
-    for app in response.json().get("applications", []):
-        if app.get("id") == client_id:
-            found_app = True
-            scopes = app.get("scopes", [])
-            found_permissions = True
-            for perm in required_permissions:
-                if perm not in scopes:
-                    found_permissions = False
-                    break
-            if not found_permissions:
-                logger.error("Не удалось настроить сервисное приложение. Проверьте настройки и повторите попытку.")
-                return False
-    if not found_app:
-        logger.error("Не удалось настроить сервисное приложение. Проверьте настройки и повторите попытку.")
-        return False
-
 
     logger.info(f"Сервисное приложение с ID {client_id} успешно настроено. Выполняем проверку валидности токена сервисного приложения...")
     check_service_app_status(settings)
@@ -3874,8 +3881,8 @@ def check_service_app_status(settings: "SettingParams", skip_permissions_check: 
             settings.service_app_status = False
             return False
 
-        if len(applications) == 0:
-            logger.info("Список сервисных приложений пуст. Невозможно проверить статус сервисного приложения.")
+        if error_message:
+            logger.error(error_message)
             settings.service_app_status = False
             return False
 
