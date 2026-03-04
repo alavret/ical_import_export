@@ -3450,7 +3450,7 @@ def export_service_applications_api_data(settings: "SettingParams") -> bool:
         os.makedirs(target_dir)
     base_name = os.path.basename(settings.service_app_api_data_file)
     name_root, ext = os.path.splitext(base_name)
-    timestamp = datetime.now().strftime("%d%m%y_%H%M%S")
+    timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
     output_filename = f"{name_root}_{timestamp}{ext}"
     output_path = os.path.join(target_dir, output_filename) if target_dir else output_filename
     with open(output_path, "w", encoding="utf-8") as file:
@@ -4416,7 +4416,7 @@ def list_mail_routing_rules(settings: "SettingParams") -> bool:
 
     base_name = os.path.basename(settings.routing_rules_file)
     name_root, ext = os.path.splitext(base_name)
-    timestamp = datetime.now().strftime("%d%m%y_%H%M%S")
+    timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
     output_filename = f"{name_root}_{timestamp}{ext}"
     output_path = os.path.join(settings.reports_dir, output_filename)
 
