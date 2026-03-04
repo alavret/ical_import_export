@@ -1874,7 +1874,7 @@ def parse_input_files(input_dir: str) -> list[dict[str, list[dict[str, list[str]
     Filename format: user[~layer~][_YYMMDD_HHMMSS|_YYYYMMDD_HHMMSS][_N].ics
     where:
       - user: nickname (e.g. romans) or email (e.g. romans@yandry.ru)
-      - layer: calendar layer name, separated by ~; if wrapped in *, it's the default layer
+      - layer: calendar layer name, separated by ~; if wrapped in {}, it's the default layer
       - timestamp: optional, in YYMMDD_HHMMSS or YYYYMMDD_HHMMSS format
       - N: optional file sequence number
     """
@@ -1924,7 +1924,7 @@ def parse_input_files(input_dir: str) -> list[dict[str, list[dict[str, list[str]
         # Determine layer name
         if layer_raw is None:
             layer_name = "DEFAULT"
-        elif layer_raw.startswith("*") and layer_raw.endswith("*") and len(layer_raw) > 2:
+        elif layer_raw.startswith("{") and layer_raw.endswith("}") and len(layer_raw) > 2:
             layer_name = layer_raw[1:-1]
         else:
             layer_name = layer_raw
@@ -2110,7 +2110,7 @@ def export_events_for_user(
 
         layer_name = calendar["name"].replace(" ", "_")
         if is_default:
-            layer_name = f"*{layer_name}*"
+            layer_name = f"{{{layer_name}}}"
         base_name = f"{nickname}~{layer_name}"
 
         files_created = 0
