@@ -3606,6 +3606,10 @@ def setup_service_application(settings: "SettingParams") -> bool:
         else:
             return False
 
+    if len(applications) == 0:
+        logger.error("Список сервисных приложений пуст. Невозможно настроить сервисное приложение.")
+        return False
+
     client_id = settings.service_app_id
     required_permissions = SERVICE_APP_PERMISSIONS
     changed = False
@@ -3667,6 +3671,28 @@ def setup_service_application(settings: "SettingParams") -> bool:
     except Exception as e:
         logger.error(f"Неожиданная ошибка при обновлении сервисных приложений: {type(e).__name__}: {e}")
         return False
+
+    if len(response.json().get("applications", [])) == 0:
+        logger.error("Не удалось настроить сервисное приложение. Проверьте настройки и повторите попытку.")
+        return False
+    
+    found_app = False
+    for app in response.json().get("applications", []):
+        if app.get("id") == client_id:
+            found_app = True
+            scopes = app.get("scopes", [])
+            found_permissions = True
+            for perm in required_permissions:
+                if perm not in scopes:
+                    found_permissions = False
+                    break
+            if not found_permissions:
+                logger.error("Не удалось настроить сервисное приложение. Проверьте настройки и повторите попытку.")
+                return False
+    if not found_app:
+        logger.error("Не удалось настроить сервисное приложение. Проверьте настройки и повторите попытку.")
+        return False
+
 
     logger.info(f"Сервисное приложение с ID {client_id} успешно настроено. Выполняем проверку валидности токена сервисного приложения...")
     check_service_app_status(settings)
@@ -3764,7 +3790,7 @@ def delete_service_application_from_list(settings: "SettingParams") -> bool:
         else:
             return False
 
-    if not applications:
+    if len(applications) == 0:
         logger.info("Список сервисных приложений пуст. Нечего удалять.")
         settings.service_app_status = False
         return True
@@ -3842,6 +3868,16 @@ def check_service_app_status(settings: "SettingParams", skip_permissions_check: 
             else:
                 settings.service_app_status = False
                 return False
+        
+        if len(applications) == 0:
+            logger.info("Список сервисных приложений пуст. Невозможно проверить статус сервисного приложения.")
+            settings.service_app_status = False
+            return False
+
+        if len(applications) == 0:
+            logger.info("Список сервисных приложений пуст. Невозможно проверить статус сервисного приложения.")
+            settings.service_app_status = False
+            return False
 
     # получаем первую страницу списка пользователей
     logger.info("Получение первой страницы списка всех пользователей организации из API...")
