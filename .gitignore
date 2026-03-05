@@ -60,3 +60,5 @@ l10n/
 python-env-tools/**
 !search_aliases.txt
 !fields_spec.txt
+!user_mapping.txt
+!ical_modify_rules.txt

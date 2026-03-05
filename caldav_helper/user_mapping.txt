@@ -1,0 +1,2 @@
+external_email;y360_email
+user1;user2

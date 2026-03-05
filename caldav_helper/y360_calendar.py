@@ -135,6 +135,7 @@ class SettingParams:
     external_caldav_users_file: str
     external_caldav_url: str
     service_app_api_data_file: str
+    user_mapping_file: str
     
 
 class TokenError(RuntimeError):
@@ -168,6 +169,7 @@ def get_settings() -> Optional[SettingParams]:
         external_caldav_users_file=os.environ.get("EXTERNAL_CALDAV_USERS_FILE", "external_caldav_users.csv"),
         external_caldav_url=os.environ.get("EXTERNAL_CALDAV_URL", ""),
         service_app_api_data_file=os.environ.get("SERVICE_APP_API_DATA_FILE", "service_app_api_data.json"),
+        user_mapping_file=os.environ.get("USER_MAPPING_FILE", "user_mapping.txt"),
     )
 
     if not settings.users_file:
@@ -490,7 +492,7 @@ def find_users_prompt(
     double_users_flag = False
     users_to_add: list[dict] = []
     all_users_flag = False
-    print('\nВведите пользователей (алиасы, uid, фамилия), разделённые запятой или пробелом.')
+    print('\nВведите пользователей в Яндекс 360 (алиасы, uid, фамилия), разделённые запятой или пробелом.')
     print('* - все пользователи, ! - загрузить из файла, Enter - выход в меню.\n')
     if not answer:
         answer = input('Пользователи: ')
@@ -1871,20 +1873,118 @@ def caldav_delete_event(
     return False, session
 
 
+def load_user_mapping(mapping_file: str) -> dict[str, str]:
+    """Load user mapping from file. Returns dict {external_alias: y360_alias}.
+
+    File format:
+      - First line is header: external_email;y360_email
+      - Lines starting with # are comments and skipped
+      - Values can be email (alias@domain.com) or plain alias
+      - Only the alias part (before @) is stored
+    """
+    mapping: dict[str, str] = {}
+    if not os.path.isfile(mapping_file):
+        logger.info(f"Файл user mapping '{mapping_file}' не найден, маппинг пользователей не используется.")
+        return mapping
+
+    try:
+        with open(mapping_file, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError as exc:
+        logger.error(f"Не удалось прочитать файл user mapping '{mapping_file}': {exc}")
+        return mapping
+
+    if not lines:
+        logger.warning(f"Файл user mapping '{mapping_file}' пуст.")
+        return mapping
+
+    for line_num, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line_num == 1 and line.lower() == "external_email;y360_email":
+            continue
+        parts = line.split(";")
+        if len(parts) < 2:
+            logger.warning(f"User mapping: строка {line_num} пропущена (ожидается два значения через ';'): {line}")
+            continue
+        ext_val = parts[0].strip()
+        y360_val = parts[1].strip()
+        if not ext_val or not y360_val:
+            logger.warning(f"User mapping: строка {line_num} пропущена (пустое значение): {line}")
+            continue
+        ext_alias = ext_val.split("@")[0].lower() if "@" in ext_val else ext_val.lower()
+        y360_alias = y360_val.split("@")[0].lower() if "@" in y360_val else y360_val.lower()
+        mapping[ext_alias] = y360_alias
+
+    if mapping:
+        logger.info(f"User mapping загружен из '{mapping_file}': {len(mapping)} записей.")
+        for ext_a, y360_a in mapping.items():
+            logger.info(f"  User mapping: '{ext_a}' -> '{y360_a}'")
+    else:
+        logger.info(f"Файл user mapping '{mapping_file}' не содержит записей маппинга.")
+
+    return mapping
+
+
+def apply_user_mapping(
+    files_map: dict[str, dict[str, list[str]]],
+    user_mapping: dict[str, str],
+) -> tuple[dict[str, dict[str, list[str]]], list[tuple[str, str]]]:
+    """Apply user mapping to files_map keys. Returns updated files_map and list of applied substitutions.
+
+    If an alias from files_map matches a key in user_mapping, the entry is
+    re-keyed to the corresponding y360 alias.
+    """
+    if not user_mapping:
+        return files_map, []
+
+    applied: list[tuple[str, str]] = []
+    new_map: dict[str, dict[str, list[str]]] = {}
+
+    for alias, layers in files_map.items():
+        target_alias = user_mapping.get(alias)
+        if target_alias is not None:
+            logger.info(f"User mapping: алиас из файла '{alias}' заменён на '{target_alias}'")
+            applied.append((alias, target_alias))
+            key = target_alias
+        else:
+            key = alias
+
+        if key not in new_map:
+            new_map[key] = {k: list(v) for k, v in layers.items()}
+        else:
+            existing = new_map[key]
+            for layer_name, layer_files in layers.items():
+                if layer_name in existing:
+                    existing[layer_name].extend(layer_files)
+                else:
+                    existing[layer_name] = list(layer_files)
+
+    if applied:
+        logger.info(f"User mapping: выполнено замен алиасов: {len(applied)}")
+    else:
+        logger.info("User mapping: совпадений с алиасами из файлов не найдено.")
+
+    return new_map, applied
+
+
 def parse_input_files(input_dir: str) -> list[dict[str, list[dict[str, list[str]]]]]:
     """Parse input .ics files and group them by user alias and calendar layer.
 
     Filename format: user[~layer~][_YYMMDD_HHMMSS|_YYYYMMDD_HHMMSS][_N].ics
     where:
-      - user: nickname (e.g. romans) or email (e.g. romans@yandry.ru)
+      - user: nickname (e.g. romans) or email (e.g. romans@yandry.ru);
+        may contain underscores (e.g. user_01)
       - layer: calendar layer name, separated by ~; if wrapped in {}, it's the default layer
-      - timestamp: optional, in YYMMDD_HHMMSS or YYYYMMDD_HHMMSS format
+      - timestamp: optional, in YYMMDD_HHMMSS or YYYYMMDD_HHMMSS format;
+        matched from the right so that underscores in the alias are preserved
       - N: optional file sequence number
     """
     if not os.path.isdir(input_dir):
         return []
 
-    timestamp_re = re.compile(r'_(\d{6,8}_\d{6})(?:_(\d+))?$')
+    timestamp_re = re.compile(r'^(.+)_(\d{6,8}_\d{6})(?:_(\d+))?$')
 
     # Intermediate: alias -> layer_name -> [file_paths]
     data: dict[str, dict[str, list[str]]] = {}
@@ -1911,9 +2011,9 @@ def parse_input_files(input_dir: str) -> list[dict[str, list[dict[str, list[str]
             user_str = parts[0]
             layer_raw = None
             # Strip timestamp+seq suffix from user string
-            m = timestamp_re.search(user_str)
+            m = timestamp_re.match(user_str)
             if m:
-                user_str = user_str[:m.start()]
+                user_str = m.group(1)
 
         # Extract alias from user identifier
         if "@" in user_str:
@@ -1928,7 +2028,9 @@ def parse_input_files(input_dir: str) -> list[dict[str, list[dict[str, list[str]
         if layer_raw is None:
             layer_name = "DEFAULT"
         elif layer_raw.startswith("{") and layer_raw.endswith("}") and len(layer_raw) > 2:
-            layer_name = layer_raw[1:-1]
+            # Wrapped in {} means it was the default layer in the source
+            # account; map to the target account's default layer
+            layer_name = "DEFAULT"
         else:
             layer_name = layer_raw
 
@@ -2327,11 +2429,25 @@ def import_events_for_user(
                     calendar = cal
                     break
             if not calendar:
-                logger.warning(f"{thread_prefix}Calendar layer '{layer_name}' not found for {user_email}, skipping")
-                for file_path in files:
-                    with report_lock:
-                        report_writer.writerow([user_email, layer_name, file_path, "", "", "skip", f"layer '{layer_name}' not found"])
-                continue
+                logger.warning(
+                    f"{thread_prefix}Calendar layer '{layer_name}' not found "
+                    f"for {user_email}, importing into default calendar"
+                )
+                calendar = default_calendar
+                if not calendar:
+                    logger.warning(
+                        f"{thread_prefix}No default calendar found for "
+                        f"{user_email}, skipping layer '{layer_name}'"
+                    )
+                    for file_path in files:
+                        with report_lock:
+                            report_writer.writerow([
+                                user_email, layer_name, file_path,
+                                "", "", "skip",
+                                f"layer '{layer_name}' not found, "
+                                f"default calendar not found",
+                            ])
+                    continue
 
         logger.info(f"{thread_prefix}Importing into layer '{layer_name}' (calendar '{calendar['name']}') for {user_email}")
 
@@ -2844,6 +2960,9 @@ def import_menu_parallel(settings: "SettingParams"):
         logger.error(f"No input .ics files found in {settings.input_dir}")
         return
 
+    user_mapping = load_user_mapping(settings.user_mapping_file)
+    files_map, mapping_applied = apply_user_mapping(files_map, user_mapping)
+
     while True:
         users_to_add, break_flag, double_users_flag, _all_users_flag = find_users_prompt(settings)
         if break_flag or double_users_flag or not users_to_add:
@@ -3003,6 +3122,12 @@ def import_menu_parallel(settings: "SettingParams"):
         close_report_writer(rule_apply_file)
     logger.info(f"Import report saved to {report_path}")
     logger.info(f"Rule apply report saved to {rule_apply_path}")
+    if mapping_applied:
+        logger.info(f"User mapping: при импорте были применены следующие замены алиасов ({len(mapping_applied)}):")
+        for ext_a, y360_a in mapping_applied:
+            logger.info(f"  '{ext_a}' -> '{y360_a}'")
+    else:
+        logger.info("User mapping: замены алиасов не применялись.")
 
 def import_menu_parallel_without_params(settings: "SettingParams"):
     print(f"\nИмпорт событий из ics файлов в каталоге {settings.input_dir}.")
@@ -3017,6 +3142,9 @@ def import_menu_parallel_without_params(settings: "SettingParams"):
     if not files_map:
         logger.error(f"No input .ics files found in {settings.input_dir}")
         return
+
+    user_mapping = load_user_mapping(settings.user_mapping_file)
+    files_map, mapping_applied = apply_user_mapping(files_map, user_mapping)
 
     users_to_add =get_all_api360_users(settings)
     
@@ -3166,6 +3294,12 @@ def import_menu_parallel_without_params(settings: "SettingParams"):
         close_report_writer(rule_apply_file)
     logger.info(f"Import report saved to {report_path}")
     logger.info(f"Rule apply report saved to {rule_apply_path}")
+    if mapping_applied:
+        logger.info(f"User mapping: при импорте были применены следующие замены алиасов ({len(mapping_applied)}):")
+        for ext_a, y360_a in mapping_applied:
+            logger.info(f"  '{ext_a}' -> '{y360_a}'")
+    else:
+        logger.info("User mapping: замены алиасов не применялись.")
 
 
 def list_calendars_for_user(settings: "SettingParams"):

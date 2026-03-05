@@ -1,0 +1,34 @@
+tag;operator;value1;value2
+#------------------------------------------------------------
+# --- Replace rules ---
+# Replace CLASS value (PUBLIC <-> PRIVATE):
+#   class;replace;PUBLIC;PRIVATE
+# Replace text in SUMMARY (value1/value2 are regex):
+#   summary;replace;regex_search;regex_replace
+#   Например,
+#   summary;replace;Совещание;Встреча - простая замена слова
+#   summary;replace;^\[DRAFT\]\s*; - удаление префикса [DRAFT]
+#   summary;replace;^(\w+)\s*-\s*(.+)$;\2 (\1) - перестановка частей с группами захвата
+# Replace email in ATTENDEE (value1/value2 are wildcard templates):
+#   attendee;replace;*@old-domain.com;*@new-domain.com
+# Replace email in ORGANIZER (value1/value2 are wildcard templates):
+#   organizer;replace;*@old-domain.com;*@new-domain.com
+# Replace CN name in ATTENDEE (value1/value2 are regex):
+#   attendee;replace;Old Name;New Name
+# Replace CN name in ORGANIZER (value1/value2 are regex):
+#   organizer;replace;Old Name;New Name
+# --- Delete rules ---
+# Delete ATTENDEE by email (value1 is wildcard template, tag can be * or attendee):
+#   *;delete;user@domain.com
+#   attendee;delete;*@domain.com
+# --- Add rules ---
+# Add ATTENDEE (value1/value2 are email and CN name in any order, email is required):
+#   *;add;user@domain.com;User Name
+#   *;add;User Name;user@domain.com
+#   attendee;add;user@domain.com
+#-----------------------------------------------------------
+summary;replace;Repeated meeting;Повторяющееся событие
+*;delete;user@domain.ru
+*;add;petr@domain.ru;Петр
+*;add;ivan@domain.ru
+ORGANIZER;replace;*@contoso.*;*@360.contoso.ru
