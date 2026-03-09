@@ -2174,7 +2174,10 @@ def export_events_for_user(
         return 0
 
     total_events = 0
-    nickname = user.get("alias") or user_email.split("@")[0]
+    if external_caldav_url:
+        nickname = user_email
+    else:
+        nickname = user.get("alias") or user_email.split("@")[0]
     timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
     max_bytes = settings.output_max_mb * 1024 * 1024
 
@@ -2347,6 +2350,12 @@ def delete_events_for_user(
     return deleted_count
 
 def is_user_organizer(user: dict, organizer_email: str, unique_aliases: list[str], domain_names: list[str]) -> str:
+    # Проверяем, кто является организатором события: пользователь из 360 или внешний организатор
+    # Если организатор - пользователь, в календарь которого импортируется событие, то возвращаем "organizer"
+    # Если организатор - пользователь из 360, то возвращаем "y360_organizer"
+    # Если организатор - внешний организатор, то возвращаем "external_organizer"
+    
+
     user_aliases = [alias.lower() for alias in user.get("aliases", [])]
     if not user_aliases:
         user_aliases = [user.get("nickname", "").lower()]
@@ -2480,14 +2489,19 @@ def import_events_for_user(
                 # Check if user is the organizer of the event
                 organizer_email = _extract_organizer_email(ev)
                 organizer_result = is_user_organizer(user, organizer_email, unique_aliases, domain_names)
-                if organizer_result not in ["y360_organizer"]:
+                if organizer_result not in ["organizer"]:
+                    # Если организатор не совпадает с пользователем, в календарь которого импортируется событие,
+                    # и организатор является пользователем из 360, то событие не может быть импортировано без модификации организатора
                     if change_organizer_policy == "skip":
                         with report_lock:
                             report_writer.writerow([user_email, layer_name, file_path, uid, "", "skip", "not an organizer"])
                         logger.debug(f"{thread_prefix}Skipping event {uid}: organizer '{organizer_email}' does not match user (not an organizer)")
                         continue
                     elif change_organizer_policy == "replace":
+                        original_organizer_cn = _extract_organizer_cn(ev)
                         ev = _replace_organizer_in_event(ev, user_email)
+                        if organizer_email:
+                            ev = _add_attendee_accepted_to_event(ev, organizer_email, original_organizer_cn)
                         logger.debug(f"{thread_prefix}Event {uid}: organizer changed from '{organizer_email}' to '{user_email}' (replace)")
 
                 action = "create"
@@ -4296,6 +4310,42 @@ def _extract_organizer_email(vevent_text: str) -> str:
     return ""
 
 
+def _extract_organizer_cn(vevent_text: str) -> str:
+    """Extract CN (common name) from ORGANIZER line."""
+    for line in _unfold_ical_lines(vevent_text):
+        if _get_ical_tag_name(line) != "organizer":
+            continue
+        cn_match = re.search(r"CN=([^;:]+)", line, re.IGNORECASE)
+        if cn_match:
+            return cn_match.group(1).strip().strip('"')
+        return ""
+    return ""
+
+
+def _add_attendee_accepted_to_event(vevent_text: str, email: str, cn: str) -> str:
+    """Add an attendee with PARTSTAT=ACCEPTED if not already present."""
+    email_lower = email.lower()
+    for line in _unfold_ical_lines(vevent_text):
+        if _get_ical_tag_name(line) != "attendee":
+            continue
+        mailto_match = re.search(r"mailto:(.+)", line, re.IGNORECASE)
+        if mailto_match and mailto_match.group(1).strip().lower() == email_lower:
+            return vevent_text
+
+    if cn:
+        attendee_line = f"ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;CN={cn}:mailto:{email}"
+    else:
+        attendee_line = f"ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:{email}"
+
+    lines = _unfold_ical_lines(vevent_text)
+    result = []
+    for line in lines:
+        if line.strip() == "END:VEVENT":
+            result.append(attendee_line)
+        result.append(line)
+    return "\n".join(result)
+
+
 def _replace_organizer_in_event(vevent_text: str, new_email: str) -> str:
     """Replace ORGANIZER line with simple mailto-only form, removing CN and other params."""
     lines = _unfold_ical_lines(vevent_text)
@@ -4403,7 +4453,7 @@ def parse_ics_directory_menu(settings: SettingParams):
             file_path = os.path.join(target_dir, ics_file)
             try:
                 with open(file_path, "r", encoding="utf-8") as ics_f:
-                    ics_text = ics_f.read()
+                    ics_text = html.unescape(ics_f.read())
             except Exception as exc:
                 logger.error(f"Ошибка чтения файла {ics_file}: {exc}")
                 continue
