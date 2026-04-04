@@ -22,6 +22,16 @@ import requests
 from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
 
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Отключаем проверку SSL глобально (корпоративный прокси с самоподписанным сертификатом)
+_orig_session_request = requests.Session.request
+def _patched_session_request(self, method, url, **kwargs):
+    kwargs.setdefault("verify", False)
+    return _orig_session_request(self, method, url, **kwargs)
+requests.Session.request = _patched_session_request
+
 DEFAULT_360_API_URL = "https://api360.yandex.net"
 DEFAULT_OAUTH_API_URL = "https://oauth.yandex.ru/token"
 CALDAV_BASE_URL = "https://caldav.yandex.ru"
@@ -39,6 +49,60 @@ DEFAULT_THREADS = 4
 ALL_USERS_REFRESH_IN_MINUTES = 15
 RPS_LIMIT = 100
 _last_call_caldav = 0.0
+
+# Маппинг Windows-имён часовых зон (Exchange) → IANA (Яндекс CalDAV).
+# Яндекс CalDAV может отклонять с 400 нестандартные TZID, особенно
+# в повторяющихся событиях с RECURRENCE-ID.
+WINDOWS_TO_IANA_TZID: dict[str, str] = {
+    "Russian Standard Time": "Europe/Moscow",
+    "North Asia Standard Time": "Asia/Krasnoyarsk",
+    "Kaliningrad Standard Time": "Europe/Kaliningrad",
+    "E. Europe Standard Time": "Europe/Chisinau",
+    "FLE Standard Time": "Europe/Kiev",
+    "GTB Standard Time": "Europe/Bucharest",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
+    "N. Central Asia Standard Time": "Asia/Novosibirsk",
+    "North Asia East Standard Time": "Asia/Irkutsk",
+    "Yakutsk Standard Time": "Asia/Yakutsk",
+    "Vladivostok Standard Time": "Asia/Vladivostok",
+    "Magadan Standard Time": "Asia/Magadan",
+    "Kamchatka Standard Time": "Asia/Kamchatka",
+    "Caucasus Standard Time": "Asia/Yerevan",
+    "Georgian Standard Time": "Asia/Tbilisi",
+    "Azerbaijan Standard Time": "Asia/Baku",
+    "Central Asia Standard Time": "Asia/Almaty",
+    "West Asia Standard Time": "Asia/Tashkent",
+    "China Standard Time": "Asia/Shanghai",
+    "Singapore Standard Time": "Asia/Singapore",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "Korea Standard Time": "Asia/Seoul",
+    "India Standard Time": "Asia/Kolkata",
+    "Central European Standard Time": "Europe/Warsaw",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Romance Standard Time": "Europe/Paris",
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "Eastern Standard Time": "America/New_York",
+    "Central Standard Time": "America/Chicago",
+    "Mountain Standard Time": "America/Denver",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "US Mountain Standard Time": "America/Phoenix",
+    "Atlantic Standard Time": "America/Halifax",
+    "UTC": "UTC",
+    "Altai Standard Time": "Asia/Barnaul",
+    "Astrakhan Standard Time": "Europe/Astrakhan",
+    "Belarus Standard Time": "Europe/Minsk",
+    "Russia Time Zone 3": "Europe/Samara",
+    "Russia Time Zone 10": "Asia/Srednekolymsk",
+    "Russia Time Zone 11": "Asia/Kamchatka",
+    "Sakhalin Standard Time": "Asia/Sakhalin",
+    "Tomsk Standard Time": "Asia/Tomsk",
+    "Transbaikal Standard Time": "Asia/Chita",
+    "Omsk Standard Time": "Asia/Omsk",
+    "Saratov Standard Time": "Europe/Saratov",
+    "Volgograd Standard Time": "Europe/Volgograd",
+}
 
 
 def is_verbose_logging_enabled() -> bool:
@@ -744,11 +808,247 @@ def _extract_vtimezone_blocks(ics_text: str) -> list[str]:
     return blocks
 
 
+def _extract_tzid_from_vtimezone(vtimezone_text: str) -> Optional[str]:
+    """Извлекает TZID из блока VTIMEZONE."""
+    for line in _unfold_ical_lines(vtimezone_text):
+        if line.upper().startswith("TZID:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _collect_referenced_tzids(vevent_texts: list[str]) -> set[str]:
+    """Собирает все TZID, на которые ссылаются VEVENT-блоки.
+
+    Ищет параметр TZID= в свойствах DTSTART, DTEND, RECURRENCE-ID и т.д.
+    """
+    tzids: set[str] = set()
+    tzid_re = re.compile(r'TZID=([^;:]+)', re.IGNORECASE)
+    for ev in vevent_texts:
+        for line in _unfold_ical_lines(ev):
+            for m in tzid_re.finditer(line):
+                tzids.add(m.group(1).strip())
+    return tzids
+
+
+def _filter_vtimezones_by_reference(
+    vtimezones: list[str], referenced_tzids: set[str]
+) -> list[str]:
+    """Оставляет только VTIMEZONE-блоки, на которые ссылаются события.
+
+    Также учитывает маппинг WINDOWS_TO_IANA_TZID: если ссылка
+    была нормализована, включает VTIMEZONE по IANA-имени.
+    """
+    if not referenced_tzids:
+        return []
+    filtered = []
+    for tz_block in vtimezones:
+        tzid = _extract_tzid_from_vtimezone(tz_block)
+        if tzid and tzid in referenced_tzids:
+            filtered.append(tz_block)
+    return filtered
+
+
+def _is_guid_tzid(tzid: str) -> bool:
+    """Проверяет, является ли TZID GUID-ом (Exchange иногда генерирует такие)."""
+    # Типичный GUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    return bool(re.match(
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+        tzid, re.IGNORECASE
+    ))
+
+
+def _resolve_windows_tzid(tzid: str) -> Optional[str]:
+    """Возвращает IANA-эквивалент Windows-имени TZID или None, если не нужна замена.
+
+    Обрабатывает:
+      - Прямое совпадение по WINDOWS_TO_IANA_TZID
+      - GUID-based TZID (пытаемся определить по смещению)
+      - Имена вида "(UTC+07:00) Krasnoyarsk"
+    """
+    if tzid in WINDOWS_TO_IANA_TZID:
+        return WINDOWS_TO_IANA_TZID[tzid]
+    # Уже IANA — замена не нужна
+    if "/" in tzid or tzid == "UTC":
+        return None
+    # GUID — без контекста смещения не можем конвертировать, вернём None
+    if _is_guid_tzid(tzid):
+        return None
+    # "(UTC+07:00) Krasnoyarsk" — пробуем извлечь смещение
+    m = re.match(r'^\(UTC([+-]\d{2}:\d{2})\)\s*(.+)$', tzid)
+    if m:
+        offset_str, city_hint = m.group(1), m.group(2).strip()
+        # Пробуем найти по городу в маппинге (проверяем и Windows-имя, и IANA-имя)
+        for win_name, iana_name in WINDOWS_TO_IANA_TZID.items():
+            if city_hint.lower() in win_name.lower() or city_hint.lower() in iana_name.lower():
+                return iana_name
+        # Fallback по смещению: "+07:00" → "+0700"
+        compact_offset = offset_str.replace(":", "")
+        iana = _iana_from_utc_offset(compact_offset)
+        if iana:
+            return iana
+    return None
+
+
+def _normalize_tzids_in_text(text: str, tzid_map: dict[str, str]) -> str:
+    """Заменяет все вхождения старого TZID на новый в iCal-тексте.
+
+    Обрабатывает:
+      - TZID=<old> в свойствах (DTSTART, DTEND, RECURRENCE-ID и т.д.)
+      - TZID:<old> в VTIMEZONE
+    """
+    for old_tzid, new_tzid in tzid_map.items():
+        # TZID=... (в параметрах свойств) — с учётом возможных кавычек
+        text = text.replace(f"TZID={old_tzid}", f"TZID={new_tzid}")
+        text = text.replace(f'TZID="{old_tzid}"', f"TZID={new_tzid}")
+        # TZID:... (определение в VTIMEZONE)
+        text = text.replace(f"TZID:{old_tzid}", f"TZID:{new_tzid}")
+    return text
+
+
+def _normalize_event_group_tzids(
+    event_group: list[str], vtimezones: list[str]
+) -> tuple[list[str], list[str]]:
+    """Нормализует Windows-style TZID → IANA в событиях и VTIMEZONE-блоках.
+
+    Returns:
+        (normalized_events, normalized_vtimezones)
+    """
+    # 1. Собираем все TZID, используемые в группе событий
+    referenced = _collect_referenced_tzids(event_group)
+
+    # 2. Строим маппинг замен для нестандартных TZID
+    tzid_replace_map: dict[str, str] = {}
+    for tzid in referenced:
+        replacement = _resolve_windows_tzid(tzid)
+        if replacement:
+            tzid_replace_map[tzid] = replacement
+
+    # 3. Обработка GUID TZID: находим смещение из VTIMEZONE и подбираем IANA
+    for tzid in list(referenced):
+        if _is_guid_tzid(tzid) and tzid not in tzid_replace_map:
+            # Ищем VTIMEZONE для этого GUID и берём смещение
+            for tz_block in vtimezones:
+                block_tzid = _extract_tzid_from_vtimezone(tz_block)
+                if block_tzid == tzid:
+                    offset = _extract_utc_offset_from_vtimezone(tz_block)
+                    if offset:
+                        iana = _iana_from_utc_offset(offset)
+                        if iana:
+                            tzid_replace_map[tzid] = iana
+                    break
+
+    if tzid_replace_map:
+        logger.debug(f"Normalizing TZIDs: {tzid_replace_map}")
+
+    # 4. Применяем замены к событиям
+    normalized_events = []
+    for ev in event_group:
+        normalized_events.append(_normalize_tzids_in_text(ev, tzid_replace_map))
+
+    # 5. Нормализуем и фильтруем VTIMEZONE-блоки
+    normalized_tz = []
+    for tz_block in vtimezones:
+        normalized_tz.append(_normalize_tzids_in_text(tz_block, tzid_replace_map))
+
+    # 6. Пересобираем referenced после нормализации
+    final_referenced = _collect_referenced_tzids(normalized_events)
+    filtered_tz = _filter_vtimezones_by_reference(normalized_tz, final_referenced)
+
+    # 7. Дедупликация VTIMEZONE по TZID (после замены могут появиться дубли)
+    seen_tzids: set[str] = set()
+    deduped_tz: list[str] = []
+    for tz_block in filtered_tz:
+        tzid = _extract_tzid_from_vtimezone(tz_block)
+        if tzid and tzid not in seen_tzids:
+            seen_tzids.add(tzid)
+            deduped_tz.append(tz_block)
+
+    return normalized_events, deduped_tz
+
+
+def _extract_utc_offset_from_vtimezone(vtimezone_text: str) -> Optional[str]:
+    """Извлекает TZOFFSETTO из STANDARD секции VTIMEZONE."""
+    in_standard = False
+    for line in _unfold_ical_lines(vtimezone_text):
+        stripped = line.strip().upper()
+        if stripped == "BEGIN:STANDARD":
+            in_standard = True
+        elif stripped == "END:STANDARD":
+            in_standard = False
+        elif in_standard and stripped.startswith("TZOFFSETTO:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _iana_from_utc_offset(offset: str) -> Optional[str]:
+    """Подбирает наиболее вероятный IANA TZID по UTC-смещению.
+
+    Используется как fallback для GUID и нестандартных TZID.
+    """
+    offset_to_iana = {
+        "+0200": "Europe/Kaliningrad",
+        "+0300": "Europe/Moscow",
+        "+0400": "Europe/Samara",
+        "+0500": "Asia/Yekaterinburg",
+        "+0600": "Asia/Omsk",
+        "+0700": "Asia/Krasnoyarsk",
+        "+0800": "Asia/Irkutsk",
+        "+0900": "Asia/Yakutsk",
+        "+1000": "Asia/Vladivostok",
+        "+1100": "Asia/Srednekolymsk",
+        "+1200": "Asia/Kamchatka",
+        "+0000": "UTC",
+        "-0500": "America/New_York",
+        "-0600": "America/Chicago",
+        "-0700": "America/Denver",
+        "-0800": "America/Los_Angeles",
+        "+0100": "Europe/Berlin",
+        "+0530": "Asia/Kolkata",
+    }
+    return offset_to_iana.get(offset)
+
+
 def _extract_uid_from_event(vevent_text: str) -> Optional[str]:
     for line in _unfold_ical_lines(vevent_text):
         if line.upper().startswith("UID:"):
             return line.split(":", 1)[1].strip()
     return None
+
+
+def _has_recurrence_id(vevent_text: str) -> bool:
+    """Проверяет наличие RECURRENCE-ID в VEVENT (это исключение из повторяющегося события)."""
+    for line in _unfold_ical_lines(vevent_text):
+        if line.upper().startswith("RECURRENCE-ID"):
+            return True
+    return False
+
+
+def _group_events_by_uid(events: list[str]) -> dict[str, list[str]]:
+    """Группирует VEVENT-блоки по UID.
+
+    Мастер-событие (без RECURRENCE-ID) идёт первым в списке.
+    Одиночные события (без RRULE и без RECURRENCE-ID) попадают
+    в группу из одного элемента.
+
+    Returns:
+        dict[str, list[str]]: UID → список VEVENT-блоков (мастер первым).
+    """
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []          # для сохранения порядка первого появления UID
+    for ev in events:
+        uid = _extract_uid_from_event(ev)
+        if not uid:
+            # Событие без UID — сохраняем под уникальным ключом
+            uid = f"__no_uid_{id(ev)}"
+        if uid not in groups:
+            order.append(uid)
+            groups[uid] = []
+        groups[uid].append(ev)
+    # Сортировка внутри группы: мастер (без RECURRENCE-ID) первым
+    for uid, evs in groups.items():
+        evs.sort(key=lambda e: (1 if _has_recurrence_id(e) else 0))
+    # Возвращаем OrderedDict-подобный обычный dict (Python 3.7+)
+    return {uid: groups[uid] for uid in order}
 
 
 def _replace_uid_in_event(vevent_text: str, new_uid: str) -> str:
@@ -806,7 +1106,15 @@ def _extract_summary(vevent_text: str) -> str:
     return ""
 
 
-def build_vcalendar(vevent_text: str, vtimezones: list[str]) -> str:
+def build_vcalendar(vevent_text, vtimezones: list[str]) -> str:
+    """Оборачивает один или несколько VEVENT-блоков в VCALENDAR.
+
+    Args:
+        vevent_text: один VEVENT-блок (str) **или** список VEVENT-блоков (list[str]).
+                     Список используется для повторяющихся событий с исключениями
+                     (мастер + RECURRENCE-ID блоки).
+        vtimezones:  список VTIMEZONE-блоков.
+    """
     parts = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -814,7 +1122,10 @@ def build_vcalendar(vevent_text: str, vtimezones: list[str]) -> str:
         "X-YANDEX-SKIP-INVITATION-EMAILS:true",
     ]
     parts.extend(vtimezones)
-    parts.append(vevent_text)
+    if isinstance(vevent_text, list):
+        parts.extend(vevent_text)
+    else:
+        parts.append(vevent_text)
     parts.append("END:VCALENDAR")
     return _fold_ical_lines("\n".join(parts)) + "\n"
 
@@ -2057,6 +2368,46 @@ def filter_events_by_date(
     return filtered
 
 
+def _filter_event_groups_by_date(
+    groups: dict[str, list[str]],
+    start: Optional[datetime],
+    end: Optional[datetime],
+) -> dict[str, list[str]]:
+    """Фильтрует группы событий по дате.
+
+    Для групп с RRULE (повторяющееся событие) — включаем целиком,
+    т.к. вхождения могут попадать в диапазон, даже если мастер — нет.
+    Для обычных (одиночных) событий — стандартная фильтрация по DTSTART.
+    """
+    if not start and not end:
+        return groups
+
+    filtered: dict[str, list[str]] = {}
+    for uid, evs in groups.items():
+        master = evs[0] if evs else None
+        if not master:
+            continue
+        # Если мастер имеет RRULE — включаем всю группу целиком
+        if _event_has_rrule(master):
+            filtered[uid] = evs
+            continue
+        # Иначе — включаем группу, если хоть одно событие попадает в диапазон
+        any_match = False
+        for ev in evs:
+            dtstart = _extract_dtstart(ev)
+            if not dtstart:
+                continue
+            if start and dtstart < start:
+                continue
+            if end and dtstart > end:
+                continue
+            any_match = True
+            break
+        if any_match:
+            filtered[uid] = evs
+    return filtered
+
+
 def parse_event_properties(vevent_text: str) -> dict[str, list[str]]:
     props: dict[str, list[str]] = {}
     for line in _unfold_ical_lines(vevent_text):
@@ -2473,35 +2824,50 @@ def import_events_for_user(
             ics_text = html.unescape(ics_text)
             vtimezones = _extract_vtimezone_blocks(ics_text)
             events = _extract_vevent_blocks(ics_text)
-            events = filter_events_by_date(events, start, end)
-            if not events:
+
+            # Группируем VEVENT-блоки по UID: мастер + исключения (RECURRENCE-ID)
+            # идут в одном PUT-запросе, чтобы Яндекс корректно создал
+            # повторяющееся событие со всеми смещениями.
+            event_groups = _group_events_by_uid(events)
+            event_groups = _filter_event_groups_by_date(event_groups, start, end)
+            if not event_groups:
                 continue
 
-            for ev in events:
-                uid = _extract_uid_from_event(ev)
+            for group_uid, event_group in event_groups.items():
+                master_ev = event_group[0]
+                uid = _extract_uid_from_event(master_ev)
                 if not uid:
                     with report_lock:
                         report_writer.writerow([user_email, layer_name, file_path, "", "", "skip", "missing UID"])
                     continue
-                original_ev = ev
                 original_uid = uid
+                is_recurring_group = len(event_group) > 1 or _event_has_rrule(master_ev)
+                if is_recurring_group:
+                    exceptions_count = sum(1 for e in event_group if _has_recurrence_id(e))
+                    logger.debug(
+                        f"{thread_prefix}Recurring event UID={uid}: "
+                        f"master + {exceptions_count} exception(s)"
+                    )
 
-                # Check if user is the organizer of the event
-                organizer_email = _extract_organizer_email(ev)
+                # Проверка организатора — по мастер-событию
+                organizer_email = _extract_organizer_email(master_ev)
                 organizer_result = is_user_organizer(user, organizer_email, unique_aliases, domain_names)
                 if organizer_result not in ["organizer"]:
-                    # Если организатор не совпадает с пользователем, в календарь которого импортируется событие,
-                    # и организатор является пользователем из 360, то событие не может быть импортировано без модификации организатора
                     if change_organizer_policy == "skip":
                         with report_lock:
                             report_writer.writerow([user_email, layer_name, file_path, uid, "", "skip", "not an organizer"])
                         logger.debug(f"{thread_prefix}Skipping event {uid}: organizer '{organizer_email}' does not match user (not an organizer)")
                         continue
                     elif change_organizer_policy == "replace":
-                        original_organizer_cn = _extract_organizer_cn(ev)
-                        ev = _replace_organizer_in_event(ev, user_email)
-                        if organizer_email:
-                            ev = _add_attendee_accepted_to_event(ev, organizer_email, original_organizer_cn)
+                        original_organizer_cn = _extract_organizer_cn(master_ev)
+                        # Заменяем организатора во всех VEVENT группы
+                        replaced_group = []
+                        for ev in event_group:
+                            ev = _replace_organizer_in_event(ev, user_email)
+                            if organizer_email:
+                                ev = _add_attendee_accepted_to_event(ev, organizer_email, original_organizer_cn)
+                            replaced_group.append(ev)
+                        event_group = replaced_group
                         logger.debug(f"{thread_prefix}Event {uid}: organizer changed from '{organizer_email}' to '{user_email}' (replace)")
 
                 action = "create"
@@ -2519,18 +2885,30 @@ def import_events_for_user(
                         etag = conflict.get("etag")
                     elif conflict_policy == "regen":
                         new_uid = str(uuid.uuid4())
-                        ev = _replace_uid_in_event(ev, new_uid)
+                        # Заменяем UID во всех VEVENT группы
+                        event_group = [_replace_uid_in_event(ev, new_uid) for ev in event_group]
                         uid = new_uid
                         target_href = f"{uid}.ics"
                         action = "create"
 
-                ev, rule_changes = modify_ics_content(ev, modify_rules)
-                if rule_changes and rule_apply_writer and rule_apply_lock:
-                    file_basename = os.path.basename(file_path)
-                    with rule_apply_lock:
-                        for rule_text, old_val, new_val in rule_changes:
-                            rule_apply_writer.writerow([file_basename, rule_text, old_val, new_val])
-                vcalendar = build_vcalendar(ev, vtimezones)
+                # Применяем правила модификации к каждому VEVENT в группе
+                modified_group = []
+                for ev in event_group:
+                    ev, rule_changes = modify_ics_content(ev, modify_rules)
+                    if rule_changes and rule_apply_writer and rule_apply_lock:
+                        file_basename = os.path.basename(file_path)
+                        with rule_apply_lock:
+                            for rule_text, old_val, new_val in rule_changes:
+                                rule_apply_writer.writerow([file_basename, rule_text, old_val, new_val])
+                    modified_group.append(ev)
+
+                # Собираем VCALENDAR: все VEVENT группы в одном запросе.
+                # Нормализуем Windows-style TZID → IANA и фильтруем
+                # лишние VTIMEZONE-блоки (только используемые).
+                norm_group, norm_tz = _normalize_event_group_tzids(
+                    modified_group, vtimezones
+                )
+                vcalendar = build_vcalendar(norm_group, norm_tz)
                 if action == "create":
                     ok, session = caldav_put_event(
                         session,
@@ -2565,10 +2943,13 @@ def import_events_for_user(
                             regen_retry_delays = [(0.1,), (0.1, 0.3)]
                             for retry_delays in regen_retry_delays:
                                 new_uid = str(uuid.uuid4())
-                                regen_ev = _replace_uid_in_event(ev, new_uid)
+                                regen_group = [_replace_uid_in_event(ev, new_uid) for ev in modified_group]
                                 uid = new_uid
                                 target_href = f"{uid}.ics"
-                                vcalendar = build_vcalendar(regen_ev, vtimezones)
+                                regen_norm, regen_tz = _normalize_event_group_tzids(
+                                    regen_group, vtimezones
+                                )
+                                vcalendar = build_vcalendar(regen_norm, regen_tz)
                                 ok, session = caldav_put_event(
                                     session,
                                     calendar["url"],
@@ -2622,7 +3003,6 @@ def import_events_for_user(
                     with report_lock:
                         report_writer.writerow([user_email, layer_name, file_path, original_uid, uid, "error", "PUT failed"])
                 time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
-                ev = original_ev
 
     logger.info(f"{thread_prefix}Imported {total_imported} events for {user_email}")
     return total_imported
